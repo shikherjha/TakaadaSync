@@ -2,8 +2,9 @@
 
 A backend service that integrates with an external accounting system, syncs financial data locally, and exposes API endpoints for receivables insights.
 
-## Architecture
+## Architecture Diagrams
 
+### 1. High-Level Architecture
 ```mermaid
 graph LR
     A[External Accounting API] -->|Polling every 5 min| B[Celery Worker]
@@ -15,44 +16,73 @@ graph LR
     G[Client] -->|HTTP| F
 ```
 
-### How it works
+### 2. Data Synchronization Flow
+```mermaid
+sequenceDiagram
+    participant Beat
+    participant Worker
+    participant ExternalAPI
+    participant DB
 
-1. **Celery Beat** triggers a sync task every 5 minutes
-2. **Celery Worker** picks up the task, fetches customers → invoices → payments from the external API
-3. Data is **upserted** into PostgreSQL using `external_id` as the conflict key (idempotent)
-4. **FastAPI** serves insight endpoints that query the local database
+    Beat->>Worker: Trigger sync job
+    Worker->>ExternalAPI: GET /customers
+    ExternalAPI-->>Worker: customer data
+    Worker->>DB: Upsert customers
+
+    Worker->>ExternalAPI: GET /invoices
+    ExternalAPI-->>Worker: invoice data
+    Worker->>DB: Upsert invoices
+
+    Worker->>ExternalAPI: GET /payments
+    ExternalAPI-->>Worker: payment data
+    Worker->>DB: Upsert payments
+```
+
+### 3. Insight Request Flow
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant DB
+
+    Client->>API: GET /customers/{id}/outstanding
+    API->>DB: Query invoices + payments
+    DB-->>API: data
+    API->>API: Calculate outstanding
+    API-->>Client: JSON response
+```
 
 The system follows an **eventual consistency** model — there's a window of up to 5 minutes where the local DB may lag behind the external system. This was a deliberate trade-off for simplicity, since we can't assume the external API supports webhooks.
 
 ## Database Schema
 
-```
-customers
-├── id (PK)
-├── external_id (unique)
-├── name
-├── email
-├── created_at
-└── updated_at
+```mermaid
+erDiagram
+    CUSTOMERS ||--o{ INVOICES : has
+    INVOICES ||--o{ PAYMENTS : receives
 
-invoices
-├── id (PK)
-├── external_id (unique)
-├── customer_id (FK → customers)
-├── amount
-├── due_date
-├── status
-├── created_at
-└── updated_at
+    CUSTOMERS {
+        int id
+        string external_id
+        string name
+        string email
+    }
 
-payments
-├── id (PK)
-├── external_id (unique)
-├── invoice_id (FK → invoices)
-├── amount
-├── payment_date
-├── created_at
-└── updated_at
+    INVOICES {
+        int id
+        string external_id
+        int customer_id
+        decimal amount
+        date due_date
+    }
+
+    PAYMENTS {
+        int id
+        string external_id
+        int invoice_id
+        decimal amount
+        date payment_date
+    }
 ```
 
 **Relationships:** Customer → many Invoices → many Payments
