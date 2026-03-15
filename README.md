@@ -2,20 +2,6 @@
 
 A backend service that integrates with an external accounting system, syncs financial data locally, and exposes API endpoints for receivables insights.
 
-## Key Engineering Highlights
-
-- **Robust Background Processing**: Uses **Celery + Redis** instead of basic cron jobs, providing proper task queueing, automatic retries with exponential backoff on API failures, and concurrency control.
-- **API Rate Limiting**: A custom **Redis-based sliding window** rate limiter protects the externally facing insight endpoints from abuse.
-- **Complete Containerization**: The entire ecosystem (Postgres, Redis, API, Celery Worker, Celery Beat scheduler, and Mock API) is fully containerized and orchestrated via **Docker Compose** for true one-click local deployment.
-- **N+1 Query Prevention**: All ORM queries use `joinedload` to eager-load relationships in a single SQL hit instead of lazy-loading per row.
-- **Denormalized Balances (Zero Read Latency)**: Customer outstanding and credit amounts are pre-calculated during the background sync and stored directly on the customer row, making API reads essentially O(1).
-- **FinTech Business Logic**: 
-  - **Aging Report**: Standard accounting aging buckets (Current, 1-30, 31-60, 61-90, 90+ days) are computed accurately.
-  - **Credit/Overpayment Handling**: If a customer overpays, outstanding floors to $0 and the excess is explicitly exposed as `available_credit`.
-  - **Risk Classification**: Simple heuristic risk levels (low/medium/high) automatically assign based on overdue count and days past due.
-- **Idempotent Synchronization**: PostgreSQL `ON CONFLICT DO UPDATE` ensures that re-running or retrying failed syncs never creates duplicate records.
-- **True Network Integration**: The mock external API runs in a completely isolated container with its own memory space. The worker makes actual HTTP requests over the Docker network, accurately simulating a real third-party integration.
-
 ## Architecture Diagrams
 
 ### 1. High-Level Architecture
@@ -104,6 +90,21 @@ erDiagram
 ```
 
 **Relationships:** Customer → many Invoices → many Payments
+
+## Key Engineering Highlights
+
+- **Robust Background Processing**: Uses **Celery + Redis** instead of basic cron jobs, providing proper task queueing, automatic retries with exponential backoff on API failures, and concurrency control.
+- **API Rate Limiting**: A custom **Redis-based sliding window** rate limiter protects the externally facing insight endpoints from abuse.
+- **Complete Containerization**: The entire ecosystem (Postgres, Redis, API, Celery Worker, Celery Beat scheduler, and Mock API) is fully containerized and orchestrated via **Docker Compose** for true one-click local deployment.
+- **N+1 Query Prevention**: All ORM queries use `joinedload` to eager-load relationships in a single SQL hit instead of lazy-loading per row.
+- **Denormalized Balances (Zero Read Latency)**: Customer outstanding and credit amounts are pre-calculated during the background sync and stored directly on the customer row, making API reads essentially O(1).
+- **FinTech Business Logic**: 
+  - **Aging Report**: Standard accounting aging buckets (Current, 1-30, 31-60, 61-90, 90+ days) are computed accurately.
+  - **Credit/Overpayment Handling**: If a customer overpays, outstanding floors to $0 and the excess is explicitly exposed as `available_credit`.
+  - **Risk Classification**: Simple heuristic risk levels (low/medium/high) automatically assign based on overdue count and days past due.
+- **Idempotent Synchronization**: PostgreSQL `ON CONFLICT DO UPDATE` ensures that re-running or retrying failed syncs never creates duplicate records.
+- **True Network Integration**: The mock external API runs in a completely isolated container with its own memory space. The worker makes actual HTTP requests over the Docker network, accurately simulating a real third-party integration.
+
 
 ## API Endpoints
 
