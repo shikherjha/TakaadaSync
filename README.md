@@ -52,7 +52,7 @@ sequenceDiagram
     API-->>Client: JSON response
 ```
 
-The system follows an **eventual consistency** model — there's a window of up to 5 minutes where the local DB may lag behind the external system. This was a deliberate trade-off for simplicity, since we can't assume the external API supports webhooks.
+The system follows an **eventual consistency** model, there's a window of up to 5 minutes where the local DB may lag behind the external system. This was a deliberate trade-off for simplicity, since we can't assume the external API supports webhooks.
 
 ## Database Schema
 
@@ -112,8 +112,8 @@ erDiagram
 
 ```bash
 # Clone and run
-git clone <repo-url>
-cd takaada-integration
+git clone https://github.com/shikherjha/TakaadaSync
+cd TakaadaSync
 
 # Start everything
 docker-compose up --build
