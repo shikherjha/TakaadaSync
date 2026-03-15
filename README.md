@@ -2,6 +2,20 @@
 
 A backend service that integrates with an external accounting system, syncs financial data locally, and exposes API endpoints for receivables insights.
 
+## Key Engineering Highlights
+
+- **Robust Background Processing**: Uses **Celery + Redis** instead of basic cron jobs, providing proper task queueing, automatic retries with exponential backoff on API failures, and concurrency control.
+- **API Rate Limiting**: A custom **Redis-based sliding window** rate limiter protects the externally facing insight endpoints from abuse.
+- **Complete Containerization**: The entire ecosystem (Postgres, Redis, API, Celery Worker, Celery Beat scheduler, and Mock API) is fully containerized and orchestrated via **Docker Compose** for true one-click local deployment.
+- **N+1 Query Prevention**: All ORM queries use `joinedload` to eager-load relationships in a single SQL hit instead of lazy-loading per row.
+- **Denormalized Balances (Zero Read Latency)**: Customer outstanding and credit amounts are pre-calculated during the background sync and stored directly on the customer row, making API reads essentially O(1).
+- **FinTech Business Logic**: 
+  - **Aging Report**: Standard accounting aging buckets (Current, 1-30, 31-60, 61-90, 90+ days) are computed accurately.
+  - **Credit/Overpayment Handling**: If a customer overpays, outstanding floors to $0 and the excess is explicitly exposed as `available_credit`.
+  - **Risk Classification**: Simple heuristic risk levels (low/medium/high) automatically assign based on overdue count and days past due.
+- **Idempotent Synchronization**: PostgreSQL `ON CONFLICT DO UPDATE` ensures that re-running or retrying failed syncs never creates duplicate records.
+- **True Network Integration**: The mock external API runs in a completely isolated container with its own memory space. The worker makes actual HTTP requests over the Docker network, accurately simulating a real third-party integration.
+
 ## Architecture Diagrams
 
 ### 1. High-Level Architecture
@@ -36,6 +50,7 @@ sequenceDiagram
     Worker->>ExternalAPI: GET /payments
     ExternalAPI-->>Worker: payment data
     Worker->>DB: Upsert payments
+    Worker->>DB: Recalculate customer balances
 ```
 
 ### 3. Insight Request Flow
@@ -46,9 +61,9 @@ sequenceDiagram
     participant DB
 
     Client->>API: GET /customers/{id}/outstanding
-    API->>DB: Query invoices + payments
+    API->>DB: Read denormalized balance + overdue invoices
     DB-->>API: data
-    API->>API: Calculate outstanding
+    API->>API: Calculate risk level
     API-->>Client: JSON response
 ```
 
@@ -66,6 +81,8 @@ erDiagram
         string external_id
         string name
         string email
+        decimal total_outstanding
+        decimal available_credit
     }
 
     INVOICES {
@@ -74,6 +91,7 @@ erDiagram
         int customer_id
         decimal amount
         date due_date
+        string status
     }
 
     PAYMENTS {
@@ -92,16 +110,18 @@ erDiagram
 | Endpoint | Description |
 |--------|-------------|
 | `GET /health` | Health check |
-| `GET /customers` | List all synced customers |
-| `GET /customers/{id}/outstanding` | Outstanding balance for a specific customer |
+| `GET /customers` | List all customers with outstanding balance and credit |
+| `GET /customers/{id}/outstanding` | Detailed balance, risk level, overdue count |
 | `GET /invoices/overdue` | All overdue invoices with days overdue |
-| `GET /insights/receivables-summary` | High-level receivables overview |
+| `GET /insights/receivables-summary` | Receivables overview with aging buckets |
 
 ### Insight Calculations
 
-- **Outstanding balance** = `sum(invoice.amount) - sum(payments.amount)` for a customer
+- **Outstanding balance** = `sum(invoice.amount) - sum(payments.amount)` per customer, pre-calculated during sync
+- **Available credit** = if customer overpaid, the excess stored as credit (outstanding floors to 0)
+- **Risk level**: `low` (0 overdue), `medium` (1-2 overdue, <30 days), `high` (3+ overdue or >30 days past due)
+- **Aging buckets**: `current`, `1_to_30_days`, `31_to_60_days`, `61_to_90_days`, `90_plus_days`
 - **Overdue invoice** = `due_date < now AND outstanding > 0 AND status != 'paid'`
-- **Receivables summary** = aggregated totals across all customers
 
 ## Setup & Running
 
@@ -123,7 +143,7 @@ This spins up:
 - PostgreSQL on `:5432`
 - Redis on `:6379`
 - Mock Accounting API on `:8001`
-- FastAPI service on `:8000`
+- FastAPI service on `:8080`
 - Celery Worker + Beat (background)
 
 The API auto-runs Alembic migrations on startup, so tables are created automatically.
@@ -152,6 +172,9 @@ PYTHONPATH=. pytest tests/ -v
 ### Why polling instead of webhooks?
 The external API doesn't expose webhook endpoints, so polling is the pragmatic choice. 5-minute intervals keep things fresh without hammering the API. If webhooks become available, swapping out Celery Beat for a webhook receiver would be straightforward.
 
+### Why denormalize customer balances?
+Since we only write during sync (every 5 minutes) but read on every API request, pre-computing `total_outstanding` and `available_credit` during sync and storing them on the customer row avoids expensive `SUM()` aggregations on the read path. This is a standard read-heavy optimization.
+
 ### Why idempotent upserts?
 Using PostgreSQL's `ON CONFLICT DO UPDATE` on `external_id` means we can safely re-run syncs without worrying about duplicates. If a sync fails halfway through, the next run picks up where things left off.
 
@@ -160,6 +183,9 @@ External IDs (like `CUST-001`) are kept as-is but we use auto-incrementing inter
 
 ### Why Redis for rate limiting?
 Redis is already in the stack for Celery, so using it for a sliding window rate limiter avoids adding another dependency. Simple and works well enough for this scale.
+
+### N+1 query problem
+SQLAlchemy's lazy-loading would fire a separate query for every invoice's payments when iterating. Using `joinedload` on the overdue and summary queries fetches invoices and payments in a single SQL join, reducing database round-trips from O(N) to O(1).
 
 ## Project Structure
 
@@ -170,10 +196,10 @@ Redis is already in the stack for Celery, so using it for a sliding window rate 
 │   ├── api/
 │   │   └── routes.py           # API endpoint handlers
 │   ├── services/
-│   │   ├── insight_service.py  # Financial calculations
-│   │   └── sync_service.py     # Upsert logic
+│   │   ├── insight_service.py  # Financial calculations, risk, aging
+│   │   └── sync_service.py     # Upsert logic + balance recalculation
 │   ├── models/
-│   │   ├── customer.py
+│   │   ├── customer.py         # Includes denormalized balance columns
 │   │   ├── invoice.py
 │   │   └── payment.py
 │   ├── integrations/
@@ -197,10 +223,10 @@ Redis is already in the stack for Celery, so using it for a sliding window rate 
 
 ## Future Improvements
 
-- **Webhooks**: Replace polling with event-driven sync if the external system supports it — massively reduces latency and unnecessary API calls
+- **Webhooks**: Replace polling with event-driven sync if the external system supports it, massively reduces latency and unnecessary API calls
 - **Caching**: Add Redis TTL caching (1-2 min) on insight endpoints to avoid recomputing on every request
 - **Monitoring**: Integrate Flower for Celery dashboard, Prometheus for sync success/failure metrics, Sentry for error tracking
 - **Auth**: Add JWT authentication on insight endpoints, API key rotation for external API access
 - **Scalability**: Horizontal Celery workers for parallel syncing, PostgreSQL read replicas for heavy read loads
 - **Input validation**: More thorough Pydantic schemas for API responses
-- **Incremental sync**: Track `last_synced_at` and only fetch records modified since — reduces payload and DB writes
+- **Incremental sync**: Track `last_synced_at` and only fetch records modified since, reduces payload and DB writes
