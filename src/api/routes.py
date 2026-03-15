@@ -16,6 +16,8 @@ def list_customers(db: Session = Depends(get_db)):
             "external_id": c.external_id,
             "name": c.name,
             "email": c.email,
+            "total_outstanding": c.total_outstanding or 0.0,
+            "available_credit": c.available_credit or 0.0,
         }
         for c in customers
     ]

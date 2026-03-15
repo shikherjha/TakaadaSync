@@ -2,7 +2,10 @@ import logging
 
 from src.tasks.celery_app import celery_app
 from src.integrations.accounting_client import AccountingClient
-from src.services.sync_service import sync_customers, sync_invoices, sync_payments
+from src.services.sync_service import (
+    sync_customers, sync_invoices, sync_payments,
+    recalculate_customer_balances,
+)
 from src.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,9 @@ def sync_all_data(self):
         payments = client.get_payments()
         sync_payments(db, payments)
 
+        # recalculate denormalized balances after all data is in
+        recalculate_customer_balances(db)
+
         logger.info("Sync completed successfully")
     except Exception as e:
         logger.error(f"Sync failed: {e}")
@@ -34,3 +40,4 @@ def sync_all_data(self):
         raise self.retry(exc=e, countdown=30)
     finally:
         db.close()
+
