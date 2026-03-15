@@ -14,6 +14,7 @@ from src.services.insight_service import (
     get_customer_outstanding,
     get_overdue_invoices,
     get_receivables_summary,
+    _calculate_risk,
 )
 
 # use sqlite for tests, easier to run without docker
@@ -70,14 +71,15 @@ def test_duplicate_customer_external_id(db):
 
 # --- insight tests ---
 
-def test_customer_outstanding_calculation(db):
-    c = Customer(external_id="C1", name="Test Co", email="t@t.com")
+def test_customer_outstanding_with_denormalized_balance(db):
+    c = Customer(external_id="C1", name="Test Co", email="t@t.com",
+                 total_outstanding=600.0, available_credit=0.0)
     db.add(c)
     db.flush()
 
     inv = Invoice(
         external_id="I1", customer_id=c.id, amount=1000.0,
-        due_date=datetime(2025, 6, 1), status="pending"
+        due_date=datetime(2027, 6, 1), status="pending"
     )
     db.add(inv)
     db.flush()
@@ -90,10 +92,58 @@ def test_customer_outstanding_calculation(db):
     db.commit()
 
     result = get_customer_outstanding(db, c.id)
-    assert result["outstanding"] == 600.0
-    assert result["total_invoiced"] == 1000.0
-    assert result["total_paid"] == 400.0
+    # reads from denormalized column
+    assert result["total_outstanding"] == 600.0
+    assert result["available_credit"] == 0.0
+    assert result["risk_level"] == "low"
 
+
+def test_overpayment_shows_credit(db):
+    """If customer paid more than invoiced, they should have available_credit."""
+    c = Customer(external_id="C1", name="Test Co", email="t@t.com",
+                 total_outstanding=0.0, available_credit=200.0)
+    db.add(c)
+    db.flush()
+
+    inv = Invoice(
+        external_id="I1", customer_id=c.id, amount=800.0,
+        due_date=datetime(2027, 6, 1), status="pending"
+    )
+    db.add(inv)
+    db.flush()
+
+    p = Payment(
+        external_id="P1", invoice_id=inv.id, amount=1000.0,
+        payment_date=datetime(2025, 5, 15)
+    )
+    db.add(p)
+    db.commit()
+
+    result = get_customer_outstanding(db, c.id)
+    assert result["total_outstanding"] == 0.0
+    assert result["available_credit"] == 200.0
+
+
+# --- risk level tests ---
+
+def test_risk_low_no_overdue():
+    assert _calculate_risk(0, 0) == "low"
+
+
+def test_risk_medium_few_overdue():
+    assert _calculate_risk(1, 15) == "medium"
+    assert _calculate_risk(2, 25) == "medium"
+
+
+def test_risk_high_many_overdue():
+    assert _calculate_risk(3, 10) == "high"
+
+
+def test_risk_high_old_overdue():
+    assert _calculate_risk(1, 45) == "high"
+
+
+# --- overdue tests ---
 
 def test_overdue_invoices(db):
     c = Customer(external_id="C1", name="Test Co", email="t@t.com")
@@ -118,30 +168,47 @@ def test_overdue_invoices(db):
     assert overdue[0]["external_id"] == "I1"
 
 
-def test_receivables_summary(db):
+# --- aging + receivables summary ---
+
+def test_receivables_summary_with_aging(db):
     c = Customer(external_id="C1", name="Test Co", email="t@t.com")
     db.add(c)
     db.flush()
 
-    inv = Invoice(
-        external_id="I1", customer_id=c.id, amount=2000.0,
-        due_date=datetime(2024, 1, 1), status="pending"
-    )
-    db.add(inv)
-    db.flush()
+    now = datetime.utcnow()
 
-    p = Payment(
-        external_id="P1", invoice_id=inv.id, amount=750.0,
-        payment_date=datetime(2024, 1, 5)
+    # current (not due yet)
+    inv1 = Invoice(
+        external_id="I1", customer_id=c.id, amount=1000.0,
+        due_date=now + timedelta(days=30), status="pending"
     )
-    db.add(p)
+    # overdue 15 days (1-30 bucket)
+    inv2 = Invoice(
+        external_id="I2", customer_id=c.id, amount=500.0,
+        due_date=now - timedelta(days=15), status="pending"
+    )
+    # overdue 45 days (31-60 bucket)
+    inv3 = Invoice(
+        external_id="I3", customer_id=c.id, amount=300.0,
+        due_date=now - timedelta(days=45), status="pending"
+    )
+    # overdue 120 days (90+ bucket)
+    inv4 = Invoice(
+        external_id="I4", customer_id=c.id, amount=200.0,
+        due_date=now - timedelta(days=120), status="pending"
+    )
+    db.add_all([inv1, inv2, inv3, inv4])
     db.commit()
 
     summary = get_receivables_summary(db)
-    assert summary["total_invoiced"] == 2000.0
-    assert summary["total_paid"] == 750.0
-    assert summary["total_outstanding"] == 1250.0
-    assert summary["overdue_count"] == 1
+    aging = summary["aging"]
+
+    assert aging["current"] == 1000.0
+    assert aging["1_to_30_days"] == 500.0
+    assert aging["31_to_60_days"] == 300.0
+    assert aging["90_plus_days"] == 200.0
+    assert summary["overdue_count"] == 3
+    assert summary["total_outstanding"] == 2000.0
 
 
 # --- api client mock test ---
